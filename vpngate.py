@@ -24,6 +24,7 @@ import io
 import json
 import os
 import re
+import socket
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -50,8 +51,20 @@ VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
-# 已部署的 Cloudflare Worker 检测接口 (GET /check?proxyip=host:port, 实测确认)
-WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://v2.xk612.ccwu.cc/check?sstp=vpn:vpn@")
+# 已部署的 Cloudflare Worker 检测接口 (GET /check?sstp=vpn:vpn@host:port)
+# 支持多个候选, 逗号分隔: CHECK_WORKERS="https://a/check?sstp=vpn:vpn@,https://b/check?sstp=vpn:vpn@"
+# 启动时逐个做健康检查, 用第一个能正常应答的; 全部不可用时再降级到 runner 直连 TCP 探测
+_CHECK_WORKERS_ENV = (
+    os.environ.get("CHECK_WORKERS")
+    or os.environ.get("CHECK_WORKER")
+    or "https://v2.xk612.ccwu.cc/check?sstp=vpn:vpn@"
+)
+WORKER_CHECK_URLS = [u.strip() for u in _CHECK_WORKERS_ENV.split(",") if u.strip()]
+WORKER_CHECK_URL = WORKER_CHECK_URLS[0]   # 运行时会被 pick_worker() 改写为实际可用的那个
+WORKER_PROBE_TIMEOUT = float(os.environ.get("WORKER_PROBE_TIMEOUT", "25"))  # 健康检查单请求超时
+DIRECT_TIMEOUT = float(os.environ.get("DIRECT_TIMEOUT", "8"))               # 降级模式 TCP 握手超时
+ALLOW_DIRECT_FALLBACK = os.environ.get("ALLOW_DIRECT_FALLBACK", "1") not in ("0", "false", "False")
+CHECK_MODE = "worker"                     # worker | direct-tcp (写入 data.json, 网页可见本次检测方式)
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))   # 与 Worker 网页端一致的并发模型
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))          # 单请求客户端超时 (秒)
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限; 本地测试可设小值
@@ -368,6 +381,88 @@ def check_all(nodes, session):
 
 
 # ---------------------------------------------------------------------------
+# Worker 健康检查 + 降级直连探测
+# ---------------------------------------------------------------------------
+def probe_worker(url_tpl, samples, session):
+    """用 2~3 个真实节点探测某个 Worker 是否活着。返回 (可用?, 说明)。
+
+    '可用' 的判定标准: 能返回 HTTP 200 且 JSON 里带 success 字段。
+    不要求 success=true —— 节点本身可能是坏的, 这里只判断服务有没有正常应答。
+    """
+    errors = []
+    for n in samples:
+        url = url_tpl + quote(f"{n['host']}:{n['port']}", safe="")
+        try:
+            r = session.get(url, timeout=WORKER_PROBE_TIMEOUT,
+                            headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+            if r.status_code != 200:
+                errors.append(f"HTTP {r.status_code}")
+                continue
+            j = r.json()
+            if isinstance(j, dict) and "success" in j:
+                return True, f"HTTP 200 / JSON ok (样本 {n['host']}:{n['port']})"
+            errors.append("JSON 缺少 success 字段")
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {str(exc)[:100]}")
+    return False, " ; ".join(errors[:3])
+
+
+def pick_worker(nodes, session):
+    """依次探测候选 Worker, 返回第一个可用的 URL 模板; 全不可用返回 None。"""
+    global WORKER_CHECK_URL
+    if not nodes:
+        return None
+    samples = nodes[:max(1, min(3, len(nodes)))]
+    for url in WORKER_CHECK_URLS:
+        ok, info = probe_worker(url, samples, session)
+        short = url.split("?")[0]
+        if ok:
+            log("CLOUDFLARE WORKER", f"健康检查通过 -> {short} ({info})")
+            WORKER_CHECK_URL = url
+            return url
+        log("CLOUDFLARE WORKER", f"健康检查失败 -> {short} ({info})")
+    return None
+
+
+def direct_check_one(node):
+    """降级检测: 由 runner 直接对节点做 TCP 握手。
+    端口能连上 = 该中继的 SSTP 入口活着 (只验证连通性, 不做完整 SSTP 握手),
+    结果里会以 check_mode=direct-tcp 标注, 不冒充 Worker 检测结果。"""
+    out = dict(node)
+    out["protocol"] = "sstp"
+    out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
+    out["status"] = "failed"
+    out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    out["exit"] = None
+    out["residential"] = classify_network(node["host"], None, None)
+    target = node.get("ip") or node["host"]
+    t0 = time.time()
+    try:
+        with socket.create_connection((target, node["port"]), timeout=DIRECT_TIMEOUT):
+            pass
+        out["success"] = True
+        out["status"] = "success"
+        out["latency_ms"] = int((time.time() - t0) * 1000)
+        out["error"] = None
+    except Exception as exc:
+        out["success"] = False
+        out["latency_ms"] = None
+        out["error"] = f"{type(exc).__name__}: {str(exc)[:100]}"
+        out["worker_error"] = False
+    return out
+
+
+def check_all_direct(nodes):
+    """直连模式下的并发检测 (与 Worker 模式同样的并发度)。"""
+    results = []
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+        futures = [pool.submit(direct_check_one, n) for n in nodes]
+        for fut in as_completed(futures):
+            results.append(fut.result())
+    return results
+
+
+# ---------------------------------------------------------------------------
 # 第 4 步: 生成网页数据
 # ---------------------------------------------------------------------------
 def build_outputs(results, raw_count, sstp_count, source):
@@ -400,6 +495,8 @@ def build_outputs(results, raw_count, sstp_count, source):
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "source": source,
         "worker": WORKER_CHECK_URL,
+        "check_mode": CHECK_MODE,
+        "workers_tried": WORKER_CHECK_URLS,
         "stats": stats,
         "countries": by_country,
         "available": available,
@@ -665,23 +762,41 @@ def main():
     log("VPN GATE", f"SSTP 节点: {sstp_count}")
     log("VPN GATE", f"去重后: {len(uniq)}")
 
-    # 3) 并发检测
-    log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
-    t0 = time.time()
-    results = check_all(uniq, session)
-    elapsed = time.time() - t0
+    # 3) 选检测通道 -> 并发检测
+    global CHECK_MODE
+    active_worker = pick_worker(uniq, session)
+    if active_worker:
+        CHECK_MODE = "worker"
+        log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
+        t0 = time.time()
+        results = check_all(uniq, session)
+        elapsed = time.time() - t0
+    else:
+        # Worker 全线不可用 -> 降级为 runner 直连 TCP 端口探测, 保证流水线仍然产出真实结果
+        if not ALLOW_DIRECT_FALLBACK:
+            die("所有候选检测 Worker 均不可用且已禁用直连降级 (ALLOW_DIRECT_FALLBACK=0), 本次运行判定失败")
+        CHECK_MODE = "direct-tcp"
+        log("FALLBACK", "所有候选 Worker 不可用 -> 降级为 runner 直连 TCP 握手探测 (check_mode=direct-tcp)")
+        log("FALLBACK", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 握手超时 {DIRECT_TIMEOUT}s)")
+        t0 = time.time()
+        results = check_all_direct(uniq)
+        elapsed = time.time() - t0
 
     success = [r for r in results if r.get("success")]
     failed = [r for r in results if not r.get("success")]
     worker_errors = [r for r in failed if r.get("worker_error")]
 
-    log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
-    log("CLOUDFLARE WORKER", f"检测失败: {len(failed)}" + (f" (其中 Worker 异常 {len(worker_errors)})" if worker_errors else ""))
-    log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
+    log("CHECK", f"检测方式: {CHECK_MODE}")
+    log("CHECK", f"检测成功: {len(success)}")
+    log("CHECK", f"检测失败: {len(failed)}" + (f" (其中 Worker 异常 {len(worker_errors)})" if worker_errors else ""))
+    log("CHECK", f"耗时: {elapsed:.1f}s")
 
     # 硬性失败: Worker 完全不可达 (没有任何一个请求拿到正常响应)
-    if uniq and not success and len(worker_errors) == len(uniq):
+    if CHECK_MODE == "worker" and uniq and not success and len(worker_errors) == len(uniq):
         die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
+
+    if uniq and not success:
+        log("CHECK", "警告: 本轮没有任何节点通过检测 (如实输出空结果, 不伪造数据)")
 
     # 4) 结果 + 网页
     data = build_outputs(results, raw_count, sstp_count, source)
