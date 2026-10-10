@@ -21,10 +21,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -34,10 +34,13 @@ jobs:
       - name: Get VPN Gate nodes + check via Cloudflare Worker + build page
         run: python vpngate.py
         env:
-          # 已部署的检测 Worker (不要改动: 检测统一走这里)
-          CHECK_WORKER: "https://check.helei.kdns.fr/check?sstp=vpn:vpn@"
+          # 检测 Worker 候选列表, 逗号分隔; 启动时会逐个做健康检查, 自动选可用的那个
+          # 旧地址 check.helei.kdns.fr 域名已失效 (DNS 无解析) 导致所有检测失败, 已移除首选位
+          CHECK_WORKERS: "https://v2.xk612.ccwu.cc/check?sstp=vpn:vpn@,https://check.helei.kdns.fr/check?sstp=vpn:vpn@"
           CHECK_CONCURRENCY: "32"
           CHECK_TIMEOUT: "90"
+          # Worker 全部不可用时, 降级为 runner 直连 TCP 握手探测 (保证流水线仍有真实结果)
+          ALLOW_DIRECT_FALLBACK: "1"
 
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
