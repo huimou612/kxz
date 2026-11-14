@@ -567,8 +567,10 @@ HOSTS_URL = os.environ.get("HOSTS_URL", "https://huimou612.github.io/kxz/hosts.t
 
 
 def build_hosts_text(data, countries=None, fast=False):
-    """生成可直接粘贴到 edgetunnel 后台「自定义优选IP」框的清单。
-    每行 = 入口地址#名字$sstp://... ; 名字固定, 底下 SSTP 节点每 30 分钟自动换。
+    """生成粘贴到 edgetunnel 后台「自定义优选IP」框的清单 (整段替换, 不可追加)。
+    每行 = 入口地址#名字$sstp://... 。注意: 静态粘贴的清单【不会】自动更新,
+    只有把订阅 URL 填进「订阅链接」框才会每 30 分钟轮换; 反复追加旧清单会
+    让过期节点永久留在订阅里, 客户端逐个测速超时就是延迟高的主因。
     fast=True 时只输出精选节点, 入口改用 FAST_EDGE_HOSTS。"""
     countries = countries if countries is not None else data["countries"]
     # 入口: 默认用实测可用优选域名循环分配; 可用 HOSTS_ENTRY 覆盖(逗号分隔)
@@ -576,11 +578,15 @@ def build_hosts_text(data, countries=None, fast=False):
     default_edge = FAST_EDGE_HOSTS if fast else EDGE_HOSTS
     edge = [e.strip() for e in _entry.split(",") if e.strip()] or default_edge or [f"{EDT_DOMAIN}:443"]
     title = ("# edgetunnel「自定义优选IP」精选清单 (本轮相对最快的节点)"
-             if fast else "# edgetunnel「自定义优选IP」清单 (整段复制, 追加到后台现有内容后面)")
+             if fast else "# edgetunnel「自定义优选IP」清单")
     lines = [
         title,
         f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
         f"# 固定地址: {HOSTS_URL[:-4] + '-fast.txt' if fast else HOSTS_URL}",
+        "# !! 用法: 整段【替换】后台框里的全部内容, 绝对不要追加到旧内容后面",
+        "# !! 静态粘贴不会自动更新; 叠加多份清单会让过期节点永久留在订阅里,",
+        "# !! 客户端逐条测速等超时 = 体感延迟极高 (线上 /sub 曾累积 78 条死节点)",
+        f"# !! 需要自动轮换请改用「订阅链接」: {SUB_URL[:-4] + '-fast-direct.txt'}",
         "# 每行 = 入口地址#名字$sstp://vpn:vpn@节点:端口",
         f"# 入口: {len(edge)} 个优选域名循环分配" + (" (已剔除实测慢入口)" if fast else ""),
         "# 账号密码固定 vpn:vpn ; 节点端口必须保留",
@@ -691,6 +697,8 @@ def build_sub_text(data, countries=None, label=""):
         f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
         f"# 固定地址: {SUB_URL[:-4] + '-fast.txt' if label else SUB_URL}",
         f"# 节点域名: {EDT_DOMAIN} (传输 ws / TLS / fingerprint {EDT_FINGERPRINT})",
+        f"# !! @ 地址写的是 {EDT_DOMAIN}; 若该域名直连超时/被阻断,",
+        f"# !! 请改用优选入口版订阅: {SUB_URL[:-4] + '-fast-direct.txt'}",
         "# 名字固定; $sstp:// 链式代理(编码在 path)每 30 分钟自动更换",
         "# 账号密码固定 vpn:vpn ; 节点端口已编码进 path",
         "# ========================================================",
@@ -783,6 +791,8 @@ def build_sub_direct_text(data, countries=None):
         "# edgetunnel 精选订阅·直连优选入口 (vless://) —— 推荐填进后台「订阅链接」",
         f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
         f"# 固定地址: {SUB_URL[:-4] + '-fast-direct.txt'}",
+        "# !! 用法: 把上面这个 URL 填进后台「订阅链接」框, 不要复制正文粘贴",
+        "# !! 同时清空「自定义优选IP」框里累积的旧清单, 避免死节点叠加拖慢测速",
         f"# 入口: {len(edge_hosts)} 个实测较快优选域名循环分配 ({', '.join(edge_hosts)})",
         f"# host/sni: {EDT_DOMAIN} (主域名直连超时, 勿写进 @ 后地址)",
         "# 节点: 每国取本轮相对最快前几个, 全局上限 FAST_TOTAL",
