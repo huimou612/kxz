@@ -567,10 +567,11 @@ HOSTS_URL = os.environ.get("HOSTS_URL", "https://huimou612.github.io/kxz/hosts.t
 
 
 def build_hosts_text(data, countries=None, fast=False):
-    """生成粘贴到 edgetunnel 后台「自定义优选IP」框的清单 (整段替换, 不可追加)。
+    """生成 edgetunnel 后台「自定义优选」用的清单 (整段替换, 不可追加)。
     每行 = 入口地址#名字$sstp://... 。注意: 静态粘贴的清单【不会】自动更新,
-    只有把订阅 URL 填进「订阅链接」框才会每 30 分钟轮换; 反复追加旧清单会
-    让过期节点永久留在订阅里, 客户端逐个测速超时就是延迟高的主因。
+    反复追加旧清单会让过期节点永久留在订阅里, 客户端逐个测速超时就是延迟高的主因。
+    实测可行的自动轮换方式: 后台「自定义优选」里只放一行 URL 指向本文件,
+    Worker 生成订阅时会拉取它, 本文件每 30 分钟由 kxz Actions 刷新。
     fast=True 时只输出精选节点, 入口改用 FAST_EDGE_HOSTS。"""
     countries = countries if countries is not None else data["countries"]
     # 入口: 默认用实测可用优选域名循环分配; 可用 HOSTS_ENTRY 覆盖(逗号分隔)
@@ -586,7 +587,9 @@ def build_hosts_text(data, countries=None, fast=False):
         "# !! 用法: 整段【替换】后台框里的全部内容, 绝对不要追加到旧内容后面",
         "# !! 静态粘贴不会自动更新; 叠加多份清单会让过期节点永久留在订阅里,",
         "# !! 客户端逐条测速等超时 = 体感延迟极高 (线上 /sub 曾累积 78 条死节点)",
-        f"# !! 需要自动轮换请改用「订阅链接」: {SUB_URL[:-4] + '-fast-direct.txt'}",
+        "# !! 自动轮换: 后台「自定义优选」里只填一行 URL 指向本文件即可,",
+        "# !! Worker 生成订阅时会拉取它, 本文件每 30 分钟由 kxz Actions 刷新",
+        f"# !! 该 URL = {HOSTS_URL[:-4] + '-fast.txt' if fast else HOSTS_URL}",
         "# 每行 = 入口地址#名字$sstp://vpn:vpn@节点:端口",
         f"# 入口: {len(edge)} 个优选域名循环分配" + (" (已剔除实测慢入口)" if fast else ""),
         "# 账号密码固定 vpn:vpn ; 节点端口必须保留",
@@ -769,7 +772,7 @@ def select_fast_countries(data):
 
 
 def build_sub_direct_text(data, countries=None):
-    """生成「客户端可直连」的精选 vless:// 订阅 (推荐填进后台「订阅链接」)。
+    """生成「客户端可直连」的精选 vless:// 订阅 (可直接导入客户端)。
 
     与 sub.txt 的区别: @ 后地址用实测最快的优选域名(借 Cloudflare 入口 IP),
     host/sni 仍指向 Worker 主域名 —— 与线上 /sub 实际产出的格式一致。
@@ -788,11 +791,12 @@ def build_sub_direct_text(data, countries=None):
     if not edge_hosts:
         edge_hosts = [EDT_DOMAIN]
     lines = [
-        "# edgetunnel 精选订阅·直连优选入口 (vless://) —— 推荐填进后台「订阅链接」",
+        "# edgetunnel 精选订阅·直连优选入口 (vless://) —— 可直接导入客户端",
         f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
         f"# 固定地址: {SUB_URL[:-4] + '-fast-direct.txt'}",
-        "# !! 用法: 把上面这个 URL 填进后台「订阅链接」框, 不要复制正文粘贴",
-        "# !! 同时清空「自定义优选IP」框里累积的旧清单, 避免死节点叠加拖慢测速",
+        "# !! 用法: 把上面的 URL 直接导入客户端作为独立订阅 (不过 edgetunnel 后台)",
+        f"# !! 后台自动轮换请用 URL 汇聚方式指向 {HOSTS_URL[:-4] + '-fast.txt'},",
+        "# !! 实测把本文件 URL 填进后台汇聚会返回空订阅",
         f"# 入口: {len(edge_hosts)} 个实测较快优选域名循环分配 ({', '.join(edge_hosts)})",
         f"# host/sni: {EDT_DOMAIN} (主域名直连超时, 勿写进 @ 后地址)",
         "# 节点: 每国取本轮相对最快前几个, 全局上限 FAST_TOTAL",
