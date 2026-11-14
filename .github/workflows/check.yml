@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
   pages: write
   id-token: write
 
@@ -61,17 +62,67 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # 修复说明: 旧版 configure-pages@v5 / deploy-pages@v4 / upload-artifact@v4 是 Node 20,
+      # 在 Node 24 runner 上被强制运行并产生弃用告警; 统一升级到官方 Node 24 版本。
       - name: Configure Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: 'public'
 
+      # 上传完成后, Actions 产物服务的元数据偶尔存在秒级可见性延迟:
+      # #167 / #180 中 deploy-pages 在上传 0.25s 后查询到 "Found 0 artifact(s)" 而失败,
+      # 但产物其实已经上传成功。先轮询确认元数据可见, 避免竞态。
+      - name: Wait for Pages artifact metadata
+        run: |
+          for i in $(seq 1 12); do
+            count=$(curl -fsS \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=github-pages" \
+              | jq -r '.total_count // 0') || count=0
+            count=${count:-0}
+            if [ "$count" -ge 1 ]; then
+              echo "github-pages artifact metadata is visible (attempt $i)"
+              exit 0
+            fi
+            echo "attempt $i/12: artifact metadata not visible yet, waiting 3s"
+            sleep 3
+          done
+          echo "::warning::artifact metadata check timed out; deployment steps will retry"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 即使产物服务短暂抖动, 也通过多次重试让本次运行最终成功, 而不是直接标红。
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
+        continue-on-error: true
+
+      - name: Wait before deployment retry
+        if: ${{ steps.deployment.outcome == 'failure' }}
+        run: |
+          echo "首次部署未取到产物元数据, 等待 15s 后重试 (产物服务偶发延迟)"
+          sleep 15
+
+      - name: Deploy to GitHub Pages (retry)
+        id: deployment_retry
+        if: ${{ steps.deployment.outcome == 'failure' }}
+        uses: actions/deploy-pages@v5
+        continue-on-error: true
+
+      - name: Wait before final deployment retry
+        if: ${{ steps.deployment.outcome == 'failure' && steps.deployment_retry.outcome == 'failure' }}
+        run: |
+          echo "产物服务仍未就绪, 再等待 30s 后进行最后一次部署尝试"
+          sleep 30
+
+      - name: Deploy to GitHub Pages (final retry)
+        id: deployment_final
+        if: ${{ steps.deployment.outcome == 'failure' && steps.deployment_retry.outcome == 'failure' }}
+        uses: actions/deploy-pages@v5
 
       - name: Show site URL
-        run: 'echo "site: ${{ steps.deployment.outputs.page_url }} (deploy outcome: ${{ steps.deployment.outputs.status }})"'
+        run: 'echo "site: ${{ steps.deployment.outputs.page_url || steps.deployment_retry.outputs.page_url || steps.deployment_final.outputs.page_url }}"'
