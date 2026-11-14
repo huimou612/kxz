@@ -634,12 +634,15 @@ SUB_URL = os.environ.get("SUB_URL", "https://huimou612.github.io/kxz/sub.txt")
 # ---------------------------------------------------------------------------
 FAST_PER_COUNTRY = max(1, int(os.environ.get("FAST_PER_COUNTRY", "4")))
 FAST_TOTAL = max(1, int(os.environ.get("FAST_TOTAL", "12")))
-# 入口只保留本机实测 TLS 握手较快的域名, 避免把慢入口轮换给每个节点
+# 入口只保留本机实测 TLS 握手较快的域名, 避免把慢入口轮换给每个节点。
+# 实测 TLS/TTFB (2026-11-14): ahrefs 0.18-0.37s / mastervolt 0.19-0.23s /
+# funko 0.28-0.29s 明显优于 mfyx 0.29-0.77s、cf.1o.ee 0.77-0.80s、
+# cf-cname 0.78-1.23s, ali.nonull.pp.ua TTFB 2.9-4.0s 最差。
 FAST_EDGE_HOSTS = [
     h.strip()
     for h in os.environ.get(
         "FAST_EDGE_HOSTS",
-        "ahrefs.com:443,www.mfyx.cn:443,www.mastervolt.com:443",
+        "ahrefs.com:443,www.mastervolt.com:443,funko.com:443",
     ).split(",")
     if h.strip()
 ]
@@ -757,6 +760,62 @@ def select_fast_countries(data):
     return picked
 
 
+def build_sub_direct_text(data, countries=None):
+    """生成「客户端可直连」的精选 vless:// 订阅 (推荐填进后台「订阅链接」)。
+
+    与 sub.txt 的区别: @ 后地址用实测最快的优选域名(借 Cloudflare 入口 IP),
+    host/sni 仍指向 Worker 主域名 —— 与线上 /sub 实际产出的格式一致。
+    实测主域名 liji.xk612.ccwu.cc 直连 9s 无 TLS 响应, 若把它写进 @ 地址,
+    客户端会完全连不上; 这也解释了为什么线上订阅要用 7 个第三方域名当入口。
+
+    节点集合复用 select_fast_countries(): 每国相对最快前几个, 全局最多 FAST_TOTAL 个,
+    把线上 78 条链式节点收敛到十几条, 大幅降低客户端随机选到慢节点的概率。
+    """
+    countries = countries if countries is not None else select_fast_countries(data)
+    raw_edges = [e.strip() for e in os.environ.get("DIRECT_SUB_EDGE_HOSTS", "").split(",") if e.strip()]
+    edge_hosts = []
+    for e in raw_edges or FAST_EDGE_HOSTS:
+        h, _, p = e.rpartition(":")
+        edge_hosts.append(h if p.isdigit() else e)
+    if not edge_hosts:
+        edge_hosts = [EDT_DOMAIN]
+    lines = [
+        "# edgetunnel 精选订阅·直连优选入口 (vless://) —— 推荐填进后台「订阅链接」",
+        f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
+        f"# 固定地址: {SUB_URL[:-4] + '-fast-direct.txt'}",
+        f"# 入口: {len(edge_hosts)} 个实测较快优选域名循环分配 ({', '.join(edge_hosts)})",
+        f"# host/sni: {EDT_DOMAIN} (主域名直连超时, 勿写进 @ 后地址)",
+        "# 节点: 每国取本轮相对最快前几个, 全局上限 FAST_TOTAL",
+        "# 链式 sstp 代理编码在 path, 每 30 分钟自动更换",
+        "# ========================================================",
+    ]
+    idx = 0
+    ordered = sorted(
+        countries.items(),
+        key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])),
+    )
+    for cname, grp in ordered:
+        code = str(grp.get("code") or "?").upper()
+        zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
+        nodes = sorted(
+            grp["nodes"],
+            key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("host") or ""),
+        )
+        for i, n in enumerate(nodes, 1):
+            name = f"{zh}-快-{i:02d}"
+            chain = {"type": "sstp", **_socks5_account(f"vpn:vpn@{n['host']}:{n['port']}", 443)}
+            chain_json = json.dumps(chain, separators=(",", ":"))
+            path = quote("/video/" + _b64_secret_encode(chain_json, EDT_UUID), safe="")
+            host = edge_hosts[idx % len(edge_hosts)]
+            idx += 1
+            lines.append(
+                f"vless://{EDT_UUID}@{host}:443?security=tls&type=ws"
+                f"&host={EDT_DOMAIN}&fp={EDT_FINGERPRINT}&sni={EDT_DOMAIN}"
+                f"&path={path}&encryption=none&alpn=#{quote(name, safe='')}"
+            )
+    return "\n".join(lines) + "\n"
+
+
 def write_outputs(data):
     os.makedirs(PUBLIC_DIR, exist_ok=True)
     data_path = os.path.join(PUBLIC_DIR, "data.json")
@@ -790,7 +849,7 @@ def write_outputs(data):
     with open(sub_path, "w", encoding="utf-8") as f:
         f.write(build_sub_text(data))
 
-    # 精选清单: 原有 4 份文件保持不变, 额外产出两份供后台/客户端选用
+    # 精选清单: 原有 5 份文件保持不变, 额外产出三份供后台/客户端选用
     fast_countries = select_fast_countries(data)
     fast_sub_path = os.path.join(PUBLIC_DIR, "sub-fast.txt")
     with open(fast_sub_path, "w", encoding="utf-8") as f:
@@ -798,8 +857,12 @@ def write_outputs(data):
     fast_hosts_path = os.path.join(PUBLIC_DIR, "hosts-fast.txt")
     with open(fast_hosts_path, "w", encoding="utf-8") as f:
         f.write(build_hosts_text(data, fast_countries, fast=True))
+    # 客户端可直连的精选订阅: @ 后地址用优选域名, 避开直连超时的主域名
+    fast_direct_path = os.path.join(PUBLIC_DIR, "sub-fast-direct.txt")
+    with open(fast_direct_path, "w", encoding="utf-8") as f:
+        f.write(build_sub_direct_text(data, fast_countries))
     return (data_path, html_path, chains_path, hosts_path, sub_path,
-            fast_sub_path, fast_hosts_path)
+            fast_sub_path, fast_hosts_path, fast_direct_path)
 
 
 # ---------------------------------------------------------------------------
