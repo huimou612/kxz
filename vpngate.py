@@ -504,7 +504,7 @@ def build_outputs(results, raw_count, sstp_count, source):
     return data
 
 
-CHAIN_URL = os.environ.get("CHAIN_URL", "https://jerylihub.github.io/gate/chains.txt")
+CHAIN_URL = os.environ.get("CHAIN_URL", "https://huimou612.github.io/kxz/chains.txt")
 
 
 def build_chains_text(data):
@@ -563,24 +563,26 @@ EDGE_HOSTS = [
     if h.strip()
 ]
 
-HOSTS_URL = os.environ.get("HOSTS_URL", "https://jerylihub.github.io/gate/hosts.txt")
+HOSTS_URL = os.environ.get("HOSTS_URL", "https://huimou612.github.io/kxz/hosts.txt")
 
 
-def build_hosts_text(data):
+def build_hosts_text(data, countries=None, fast=False):
     """生成可直接粘贴到 edgetunnel 后台「自定义优选IP」框的清单。
-    每行 = 入口地址#名字$sstp://... ; 名字固定, 底下 SSTP 节点每 30 分钟自动换。"""
-    countries = data["countries"]
-    # 入口: 默认用 7 个实测可用优选域名循环分配; 可用 HOSTS_ENTRY 覆盖(逗号分隔)
+    每行 = 入口地址#名字$sstp://... ; 名字固定, 底下 SSTP 节点每 30 分钟自动换。
+    fast=True 时只输出精选节点, 入口改用 FAST_EDGE_HOSTS。"""
+    countries = countries if countries is not None else data["countries"]
+    # 入口: 默认用实测可用优选域名循环分配; 可用 HOSTS_ENTRY 覆盖(逗号分隔)
     _entry = os.environ.get("HOSTS_ENTRY", "").strip()
-    edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS or [f"{EDT_DOMAIN}:443"]
+    default_edge = FAST_EDGE_HOSTS if fast else EDGE_HOSTS
+    edge = [e.strip() for e in _entry.split(",") if e.strip()] or default_edge or [f"{EDT_DOMAIN}:443"]
+    title = ("# edgetunnel「自定义优选IP」精选清单 (本轮相对最快的节点)"
+             if fast else "# edgetunnel「自定义优选IP」清单 (整段复制, 追加到后台现有内容后面)")
     lines = [
-        "# edgetunnel「自定义优选IP」清单 (整段复制, 追加到后台现有内容后面)",
+        title,
         f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
-        f"# 固定地址: {HOSTS_URL}",
+        f"# 固定地址: {HOSTS_URL[:-4] + '-fast.txt' if fast else HOSTS_URL}",
         "# 每行 = 入口地址#名字$sstp://vpn:vpn@节点:端口",
-        "# 入口用 7 个实测可用优选域名循环分配",
-        "# 名字 = 国家-住宅/机房-编号, 直接区分住宅与机房",
-        "# 名字固定; 只有 $sstp:// 后面的节点地址每 30 分钟自动更换",
+        f"# 入口: {len(edge)} 个优选域名循环分配" + (" (已剔除实测慢入口)" if fast else ""),
         "# 账号密码固定 vpn:vpn ; 节点端口必须保留",
         "# ========================================================",
     ]
@@ -603,18 +605,19 @@ def build_hosts_text(data):
         )
         lines.append("")
         lines.append(
-            f"# ---- {zh} {code} · {grp['count']} 节点 (住宅 {grp['residential']} / 机房 {grp['datacenter']}) ----"
+            f"# ---- {zh} {code} · {len(nodes)} 节点 (住宅 {grp.get('residential', 0)} / 机房 {grp.get('datacenter', 0)}) ----"
         )
-        res_nodes = [n for n in nodes if n.get("residential") == "residential"]
-        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
-        for i, n in enumerate(res_nodes, 1):
+        if fast:
+            named = [(f"{zh}-快-{i:02d}", n) for i, n in enumerate(nodes, 1)]
+        else:
+            res_nodes = [n for n in nodes if n.get("residential") == "residential"]
+            dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
+            named = ([(f"{zh}-住宅-{i:02d}", n) for i, n in enumerate(res_nodes, 1)]
+                     + [(f"{zh}-机房-{i:02d}", n) for i, n in enumerate(dc_nodes, 1)])
+        for name, n in named:
             entry = edge[idx % len(edge)]
             idx += 1
-            lines.append(f"{entry}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
-        for i, n in enumerate(dc_nodes, 1):
-            entry = edge[idx % len(edge)]
-            idx += 1
-            lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            lines.append(f"{entry}#{name}$sstp://vpn:vpn@{n['host']}:{n['port']}")
     return "\n".join(lines) + "\n"
 
 
@@ -622,7 +625,24 @@ def build_hosts_text(data):
 EDT_UUID = os.environ.get("EDT_UUID", "f894617f-d42b-4eba-9acb-736c1a8b1c90")
 EDT_DOMAIN = os.environ.get("EDT_DOMAIN", "liji.xk612.ccwu.cc")
 EDT_FINGERPRINT = os.environ.get("EDT_FINGERPRINT", "chrome")
-SUB_URL = os.environ.get("SUB_URL", "https://jerylihub.github.io/gate/sub.txt")
+SUB_URL = os.environ.get("SUB_URL", "https://huimou612.github.io/kxz/sub.txt")
+
+# ---------------------------------------------------------------------------
+# 精选订阅: 不改动原有 4 份清单, 额外产出两份「只含相对最快节点」的清单。
+# Worker 的 responseTime 含 SSTP 握手固定开销, 绝对值会随 colo 漂移,
+# 因此按「本轮相对排名 + 每国限量」筛选, 而不是写死毫秒阈值。
+# ---------------------------------------------------------------------------
+FAST_PER_COUNTRY = max(1, int(os.environ.get("FAST_PER_COUNTRY", "4")))
+FAST_TOTAL = max(1, int(os.environ.get("FAST_TOTAL", "12")))
+# 入口只保留本机实测 TLS 握手较快的域名, 避免把慢入口轮换给每个节点
+FAST_EDGE_HOSTS = [
+    h.strip()
+    for h in os.environ.get(
+        "FAST_EDGE_HOSTS",
+        "ahrefs.com:443,www.mfyx.cn:443,www.mastervolt.com:443",
+    ).split(",")
+    if h.strip()
+]
 
 
 def _b64_secret_encode(plaintext, secret):
@@ -657,14 +677,16 @@ def _socks5_account(address, default_port=80):
     return {"username": username, "password": password, "hostname": hostname, "port": port}
 
 
-def build_sub_text(data):
+def build_sub_text(data, countries=None, label=""):
     """生成 edgetunnel 完整 vless:// 订阅 (链式代理编码在 path)。
-    填进 edgetunnel 后台「订阅链接」URL, 客户端定时拉取即可自动轮换。"""
-    countries = data["countries"]
+    填进 edgetunnel 后台「订阅链接」URL, 客户端定时拉取即可自动轮换。
+    countries/label 给精选订阅复用: 同一套编码逻辑, 只换节点集合与名字。"""
+    countries = countries if countries is not None else data["countries"]
     lines = [
-        "# edgetunnel 完整订阅 (vless://) —— 填进后台「订阅链接」URL",
+        ("# edgetunnel 精选订阅 (vless://) —— 只含本轮相对最快的节点"
+         if label else "# edgetunnel 完整订阅 (vless://) —— 填进后台「订阅链接」URL"),
         f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
-        f"# 固定地址: {SUB_URL}",
+        f"# 固定地址: {SUB_URL[:-4] + '-fast.txt' if label else SUB_URL}",
         f"# 节点域名: {EDT_DOMAIN} (传输 ws / TLS / fingerprint {EDT_FINGERPRINT})",
         "# 名字固定; $sstp:// 链式代理(编码在 path)每 30 分钟自动更换",
         "# 账号密码固定 vpn:vpn ; 节点端口已编码进 path",
@@ -687,7 +709,7 @@ def build_sub_text(data):
             ),
         )
         for i, n in enumerate(nodes, 1):
-            name = f"{zh}-{i:02d}"
+            name = f"{zh}{label}-{i:02d}"
             chain = {"type": "sstp", **_socks5_account(f"vpn:vpn@{n['host']}:{n['port']}", 443)}
             chain_json = json.dumps(chain, separators=(",", ":"))
             enc = _b64_secret_encode(chain_json, EDT_UUID)
@@ -699,6 +721,40 @@ def build_sub_text(data):
             )
             lines.append(link)
     return "\n".join(lines) + "\n"
+
+
+def select_fast_countries(data):
+    """从本轮可用节点里挑「相对最快」的一小组, 供精选订阅使用。
+
+    不用固定毫秒阈值: Worker 的 responseTime 含 SSTP 握手固定开销,
+    会随 Worker 所在 colo 整体漂移 (实测同一批节点 2730~5319ms)。
+    改为: 每个国家取延迟最低的 FAST_PER_COUNTRY 个, 再按延迟取全局前 FAST_TOTAL 个。
+    """
+    ranked = []
+    for cname, grp in (data.get("countries") or {}).items():
+        nodes = sorted(
+            [n for n in grp.get("nodes", []) if isinstance(n.get("latency_ms"), (int, float))],
+            key=lambda n: (n.get("latency_ms") or 0, n.get("host") or ""),
+        )
+        for n in nodes[:FAST_PER_COUNTRY]:
+            ranked.append((cname, grp, n))
+    ranked.sort(key=lambda t: (t[2].get("latency_ms") or 0, t[2].get("host") or ""))
+
+    picked = {}
+    for cname, grp, n in ranked[:FAST_TOTAL]:
+        g = picked.setdefault(cname, {
+            "code": grp.get("code"),
+            "count": 0,
+            "residential": 0,
+            "datacenter": 0,
+            "nodes": [],
+        })
+        g["nodes"].append(n)
+    for g in picked.values():
+        g["count"] = len(g["nodes"])
+        g["residential"] = sum(1 for n in g["nodes"] if n.get("residential") == "residential")
+        g["datacenter"] = g["count"] - g["residential"]
+    return picked
 
 
 def write_outputs(data):
@@ -733,7 +789,17 @@ def write_outputs(data):
     sub_path = os.path.join(PUBLIC_DIR, "sub.txt")
     with open(sub_path, "w", encoding="utf-8") as f:
         f.write(build_sub_text(data))
-    return data_path, html_path, chains_path, hosts_path, sub_path
+
+    # 精选清单: 原有 4 份文件保持不变, 额外产出两份供后台/客户端选用
+    fast_countries = select_fast_countries(data)
+    fast_sub_path = os.path.join(PUBLIC_DIR, "sub-fast.txt")
+    with open(fast_sub_path, "w", encoding="utf-8") as f:
+        f.write(build_sub_text(data, fast_countries, label="-快"))
+    fast_hosts_path = os.path.join(PUBLIC_DIR, "hosts-fast.txt")
+    with open(fast_hosts_path, "w", encoding="utf-8") as f:
+        f.write(build_hosts_text(data, fast_countries, fast=True))
+    return (data_path, html_path, chains_path, hosts_path, sub_path,
+            fast_sub_path, fast_hosts_path)
 
 
 # ---------------------------------------------------------------------------
@@ -803,12 +869,9 @@ def main():
     log("RESULT", f"可用节点: {len(success)}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
 
-    data_path, html_path, chains_path, hosts_path, sub_path = write_outputs(data)
-    log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(chains_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(hosts_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(sub_path, REPO_DIR)}")
+    outputs = write_outputs(data)
+    for path in outputs:
+        log("WEBSITE", f"生成 {os.path.relpath(path, REPO_DIR)}")
     log("WEBSITE", "完成 (GitHub Pages 部署由 workflow 执行)")
 
 
