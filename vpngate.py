@@ -552,13 +552,28 @@ def build_chains_text(data):
 
 
 # edgetunnel 入口地址池: 客户端直连 Cloudflare 的优选 IP:端口 (循环分配给每个国家节点当入口)
-# 可通过环境变量 EDGE_HOSTS 覆盖 (逗号分隔)
+# 可通过环境变量 EDGE_HOSTS 覆盖 (逗号分隔)。
+#
+# 测量方法很重要: 这些域名只是「借 Cloudflare 的 IP」, 客户端连的是该域名解析到的
+# CF 边缘 IP、TLS SNI 却是 EDT_DOMAIN。所以必须用
+#   curl --resolve <EDT_DOMAIN>:443:<该域名的CF IP> https://<EDT_DOMAIN>/
+# 看 time_appconnect (TLS 握手), 而不是 curl https://<该域名>/ 看 time_starttransfer ——
+# 后者测的是访问那个真实网站的响应速度, 与入口质量无关。
+#
+# 按上述正确方法实测 (2026-11-14, 两轮): p.etime.vip 0.25-0.36s、
+# ali.nonull.pp.ua 0.30s、spring.io 0.53-0.77s 最快, 其余多数 0.75-0.95s,
+# securecircle.com 的 IP 不是 Cloudflare (23.210.7.45) 无法作为入口, 故不收录。
+# 曾经误用「访问网站 TTFB」判断, 把 ali.nonull.pp.ua (2.9-4.0s) 当成最慢入口剔除,
+# 导致一批低延迟节点被误删 —— 这里保留全部可用入口, 让客户端 url-test 自行优选。
 EDGE_HOSTS = [
     h.strip()
     for h in os.environ.get(
         "EDGE_HOSTS",
         "cf-cname.xingpingcn.top:443,cf.1o.ee:443,ali.nonull.pp.ua:443,funko.com:443,"
-        "ahrefs.com:443,www.mfyx.cn:443,www.mastervolt.com:443",
+        "ahrefs.com:443,www.mfyx.cn:443,www.mastervolt.com:443,www.giannidelprete.it:443,"
+        "dianomi.com:443,mfa.gov.ua:443,saas.sin.fan:443,constitution.congress.gov:443,"
+        "p.etime.vip:443,www.sage.com:443,spring.io:443,www.wto.org:443,"
+        "www.vmware.com:443,prizepicks.com:443",
     ).split(",")
     if h.strip()
 ]
@@ -591,7 +606,7 @@ def build_hosts_text(data, countries=None, fast=False):
         "# !! Worker 生成订阅时会拉取它, 本文件每 30 分钟由 kxz Actions 刷新",
         f"# !! 该 URL = {HOSTS_URL[:-4] + '-fast.txt' if fast else HOSTS_URL}",
         "# 每行 = 入口地址#名字$sstp://vpn:vpn@节点:端口",
-        f"# 入口: {len(edge)} 个优选域名循环分配" + (" (已剔除实测慢入口)" if fast else ""),
+        f"# 入口: {len(edge)} 个优选域名循环分配" + (" (按 CF 入口握手耗时优选)" if fast else ""),
         "# 账号密码固定 vpn:vpn ; 节点端口必须保留",
         "# ========================================================",
     ]
@@ -643,15 +658,15 @@ SUB_URL = os.environ.get("SUB_URL", "https://huimou612.github.io/kxz/sub.txt")
 # ---------------------------------------------------------------------------
 FAST_PER_COUNTRY = max(1, int(os.environ.get("FAST_PER_COUNTRY", "4")))
 FAST_TOTAL = max(1, int(os.environ.get("FAST_TOTAL", "12")))
-# 入口只保留本机实测 TLS 握手较快的域名, 避免把慢入口轮换给每个节点。
-# 实测 TLS/TTFB (2026-11-14): ahrefs 0.18-0.37s / mastervolt 0.19-0.23s /
-# funko 0.28-0.29s 明显优于 mfyx 0.29-0.77s、cf.1o.ee 0.77-0.80s、
-# cf-cname 0.78-1.23s, ali.nonull.pp.ua TTFB 2.9-4.0s 最差。
+# 精选清单的入口: 按「借 CF IP + SNI 指向主域名」实测 time_appconnect 排序取前几个
+# (p.etime.vip 0.30s / ali.nonull.pp.ua 0.30s / spring.io 0.65s),
+# 再留一个客户端实测也快的 www.mastervolt.com 做保险。
+# 注意别再用「直接访问该域名网站的 TTFB」排序, 那测的不是入口延迟。
 FAST_EDGE_HOSTS = [
     h.strip()
     for h in os.environ.get(
         "FAST_EDGE_HOSTS",
-        "ahrefs.com:443,www.mastervolt.com:443,funko.com:443",
+        "p.etime.vip:443,ali.nonull.pp.ua:443,spring.io:443,www.mastervolt.com:443",
     ).split(",")
     if h.strip()
 ]
